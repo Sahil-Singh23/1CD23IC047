@@ -314,3 +314,57 @@ WHERE notificationType = 'Placement'
   AND createdAt >= NOW() - INTERVAL '7 days';
 ```
 *(Note: `SELECT DISTINCT` is used to ensure each student ID is only returned once, even if they received multiple placement notifications).*
+
+---
+
+# Stage 4
+
+This section outlines performance improvements to prevent database overwhelm caused by redundant querying on each page load.
+
+---
+
+## 1. Why Page Load Querying is Inefficient
+Fetching notifications from the relational database on every single page load is highly inefficient because:
+* **High Read Amplification:** A student navigating through different pages on a portal makes dozens of page transitions. Executing a database scan for every single transition is highly redundant since notifications rarely change between clicks.
+* **Database Contention:** With 50,000 active students clicking through the application, the database is slammed with thousands of duplicate read requests per second, driving up CPU and disk I/O.
+* **Unnecessary Network and Latency Costs:** Fetching full notification payloads repeatedly introduces substantial application latency and degrades the overall user experience.
+
+---
+
+## 2. Performance Improvement Strategies & Trade-offs
+
+To resolve this issue and improve system performance, we suggest three main strategies:
+
+### Strategy 1: Server-Side In-Memory Caching (Redis)
+Store each user's active notification feed and unread badge count in an in-memory cache like **Redis**. The API first checks Redis; if the data exists, it returns it instantly without hitting the main database.
+
+* **Advantages:**
+  * Sub-millisecond retrieval speeds (extreme performance boost).
+  * Drastically reduces primary database read load by up to 90%+.
+* **Trade-offs:**
+  * **Cache Invalidation Complexity:** The cache must be carefully invalidated or updated whenever a new notification is sent, marked as read, or deleted.
+  * **Infrastructure Overhead:** Requires hosting and maintaining a Redis cluster, adding to operational complexity and cost.
+
+---
+
+### Strategy 2: Event-Driven Real-time Push (Server-Sent Events)
+As designed in Stage 1, establish a long-lived **Server-Sent Events (SSE)** connection when the student logs in. The frontend fetches the notification list **only once** on application startup. From that point on, new notifications are pushed in real-time over the stream, updating the UI memory state without querying the database again.
+
+* **Advantages:**
+  * Completely eliminates query-on-page-load behavior.
+  * Eliminates redundant API polling or pull requests.
+  * Provides an instant, seamless, real-time user experience.
+* **Trade-offs:**
+  * **Connection Scaling Limits:** Maintaining 50,000 active, persistent TCP connections requires high-concurrency servers (like Node.js or Go) and correctly configured load balancers.
+  * **Server Memory Consumption:** Each persistent connection consumes socket handles and server memory.
+
+---
+
+### Strategy 3: Client-Side State Management and Browser Caching
+Utilize global state management (e.g., React Context, Redux, or TanStack/React Query) paired with browser storage (`sessionStorage` or `localStorage`). The frontend fetches notifications once and caches them in client-side state. Subsequent page transitions simply read from the in-memory frontend state.
+
+* **Advantages:**
+  * Zero server requests or database queries during page navigation.
+  * Extremely easy to implement on the frontend.
+* **Trade-offs:**
+  * **Stale Data Risk:** If a user has the application open in multiple tabs, changes in one tab (e.g., marking a notification as read) will not sync automatically to other tabs unless paired with a real-time push channel (like SSE).
