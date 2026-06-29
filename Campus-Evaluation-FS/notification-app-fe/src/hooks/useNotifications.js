@@ -1,20 +1,67 @@
 import { useState, useEffect } from "react";
-import { fetchNotifications } from "../apis/notifications";
+import { fetchNotifications } from "../api/notifications";
+import { Log } from "../../../logging-middleware/dist/index.js";
 
-export function useNotifications() {
+const TOKEN = import.meta.env.VITE_AUTH_TOKEN;
+
+export function useNotifications(page, filter) {
   const [notifications, setNotifications] = useState([]);
-  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    const load = async () => {
-      const data = await fetchNotifications();
-      setNotifications(data.notifications ?? []);
-    };
+    async function load() {
+      try {
+        setLoading(true);
+        setError("");
+
+        await Log({
+          stack: "frontend",
+          level: "info",
+          package: "hook",
+          message: `Loading notifications (page=${page}, filter=${filter})`,
+          token: TOKEN,
+        });
+
+        const data = await fetchNotifications(page, 10, filter);
+
+        setNotifications(data.notifications || []);
+
+        if (data.totalPages) {
+          setTotalPages(data.totalPages);
+        }
+
+        await Log({
+          stack: "frontend",
+          level: "info",
+          package: "hook",
+          message: `Loaded ${data.notifications?.length ?? 0} notifications`,
+          token: TOKEN,
+        });
+      } catch (err) {
+        setError(err.message);
+
+        await Log({
+          stack: "frontend",
+          level: "error",
+          package: "hook",
+          message: err.message,
+          token: TOKEN,
+        });
+      } finally {
+        setLoading(false);
+      }
+    }
 
     load();
-  }, [notifications]);
+  }, [page, filter]);
 
-  const totalPages = 0;
-
-  return { notifications, total, totalPages, loading: false, error: true };
+  return {
+    notifications,
+    totalPages,
+    loading,
+    error,
+  };
 }
