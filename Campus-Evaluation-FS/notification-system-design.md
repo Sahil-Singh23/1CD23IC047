@@ -241,3 +241,76 @@ SELECT COUNT(*) AS unread_count
 FROM notifications
 WHERE user_id = :user_id AND is_read = FALSE;
 ```
+
+---
+
+# Stage 3
+
+This section analyzes query performance, explains indexing strategies, and writes an optimized query for specific category notifications.
+
+---
+
+## 1. Query Analysis
+
+The legacy developer wrote the following query to fetch unread notifications for a student:
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### 1.1. Is this query accurate?
+**Yes, it is logically correct.** It correctly filters the notifications table by the student's ID (`studentID = 1042`), filters out read notifications (`isRead = false`), and sorts them in ascending order of their creation date (`createdAt ASC`).
+
+### 1.2. Why is this query performing slowly?
+As the database scaled to 50,000 students and 5,000,000 notifications, the query slowed down because:
+1. **Full Table Scan:** In the absence of a proper index, the database must perform a sequential scan of all 5,000,000 rows to find those matching `studentID = 1042` and `isRead = false`.
+2. **Sorting Overhead (Filesort):** The query performs `ORDER BY createdAt ASC`. Since the records are not pre-sorted in the database, the engine must fetch all filtered unread rows and sort them in-memory or on-disk (using temporary files). This is highly CPU and memory intensive.
+
+---
+
+## 2. Recommended Improvement & Computational Cost
+
+### 2.1. Proposed Change
+To resolve the slow scan and sorting issues, we must add a **composite index** on the exact filter and sort columns:
+
+```sql
+CREATE INDEX idx_notifications_student_unread_created 
+ON notifications (studentID, isRead, createdAt ASC);
+```
+
+### 2.2. Expected Computational Cost (Time Complexity)
+
+| Phase | Time Complexity Before (No Index) | Time Complexity After (With Composite Index) |
+| :--- | :--- | :--- |
+| **Filtering (Search)** | **$O(N)$** (Sequential search scanning $N = 5,000,000$ rows) | **$O(\log N)$** (Binary search on B-tree index) |
+| **Sorting** | **$O(M \log M)$** (Sorting $M$ matching unread notifications) | **$O(1)$** (The index is already stored pre-sorted by `createdAt ASC`) |
+| **Total Query Cost** | **$O(N + M \log M)$** | **$O(\log N + K)$** (where $K$ is the number of rows matching the query) |
+
+*This reduces execution time from seconds to milliseconds.*
+
+---
+
+## 3. Critiquing "Index on Every Column" Advice
+
+Another developer suggested adding individual indexes on *every single column* to be safe. 
+
+**This is a bad idea (an indexing anti-pattern) for several reasons:**
+
+1. **Severe Write Overhead:** Every `INSERT`, `UPDATE`, and `DELETE` operation requires updating not just the row, but also every single index on the table. With 5,000,000 rows and multiple columns, write performance will drop drastically.
+2. **Storage and RAM Bloat:** Indexes require physical disk space and memory (RAM). Indexing every column will result in index sizes that can easily exceed the actual table data size, crowding out the database cache.
+3. **Ineffective for Multi-Column Filtering:** Databases generally use only one index per table access. Having individual indexes on `studentID`, `isRead`, and `createdAt` separately does **not** help speed up a combined filter and sort; the database would have to scan one index and then filter the rest manually. A single **composite index** is far superior.
+
+---
+
+## 4. Query for Placement Notifications (Last 7 Days)
+
+To find all students who received a "Placement" notification in the last 7 days (where `notificationType` is an enum of `Event`, `Result`, `Placement`):
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+*(Note: `SELECT DISTINCT` is used to ensure each student ID is only returned once, even if they received multiple placement notifications).*
