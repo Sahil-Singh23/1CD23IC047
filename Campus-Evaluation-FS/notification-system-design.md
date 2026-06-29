@@ -368,3 +368,74 @@ Utilize global state management (e.g., React Context, Redux, or TanStack/React Q
   * Extremely easy to implement on the frontend.
 * **Trade-offs:**
   * **Stale Data Risk:** If a user has the application open in multiple tabs, changes in one tab (e.g., marking a notification as read) will not sync automatically to other tabs unless paired with a real-time push channel (like SSE).
+
+---
+
+# Stage 5
+
+This section analyzes the synchronous "Notify All" bottleneck, explains how partial failures are handled, and redesigns the system for highly reliable and fast execution.
+
+---
+
+## 1. Shortcomings of the Synchronous Loop
+The proposed synchronous loop implementation has critical flaws:
+1. **Blocking & Slowness:** It runs in a sequential `for` loop. Sending an email takes ~100ms. For 50,000 students, the loop would take **over 1.3 hours** to run, blocking the server and causing the HR's HTTP request to timeout.
+2. **Cascading Failures:** If the code crashes or the server restarts midway, the process stops. There is no way to resume or know who was missed without duplicate sending.
+3. **Tight Coupling:** Email APIs, DB writes, and socket pushes are synchronous. If the external Email API is slow or down, the database saves and app pushes are completely blocked.
+
+---
+
+## 2. Mid-Loop Failure Impact
+When the `send_email` call fails for 200 students midway:
+* **The Entire Process Stops:** The loop crashes or throws an exception.
+* **Partial State Inconsistency:** Students before the failure received the notification. Students after the failure receive absolutely nothing.
+* **Double Sending Risk:** Restarting the loop would send duplicate notifications to those who already received them.
+
+---
+
+## 3. High Performance Redesign: Decoupling via Queue
+
+To make this system extremely reliable and lightning-fast:
+* **Decouple Database Writes & Email Sending:** These operations **must happen separately**. Emails are external and slow; DB writes are internal and fast. They should never block each other.
+* **Asynchronous Message Queue:** The HTTP request accepts the job, pushes a bulk event to a Message Queue (e.g., Redis-backed BullMQ or RabbitMQ), and **instantly returns a `202 Accepted` status** to the HR (taking under 10ms).
+* **Worker Pools:** Independent background workers pull tasks from the queue and execute them concurrently.
+
+---
+
+## 4. Revised Pseudocode (Asynchronous)
+
+```javascript
+// 1. API Route Handler (Runs in 10ms)
+function notify_all(student_ids, message):
+    // Push the bulk job to the queue and return immediately
+    MessageQueue.enqueue("bulk_notification", { student_ids, message })
+    return { success: true, message: "Bulk notification accepted and processing in background." }
+
+// 2. Queue Job Splitter (Runs in background)
+function process_bulk_notification(bulk_job):
+    const { student_ids, message } = bulk_job.data
+    for student_id in student_ids:
+        // Enqueue separate, independent tasks for email and in-app DB/Push
+        MessageQueue.enqueue("send_email_task", { student_id, message })
+        MessageQueue.enqueue("save_and_push_task", { student_id, message })
+
+// 3. Email Worker (Handles retries and failures independently)
+function process_send_email_task(email_job):
+    const { student_id, message } = email_job.data
+    try {
+        send_email(student_id, message)
+    } catch (err) {
+        // Failed jobs are automatically retried by the queue framework (e.g., with exponential backoff)
+        throw err 
+    }
+
+// 4. DB & Push Worker
+function process_save_and_push_task(in_app_job):
+    const { student_id, message } = in_app_job.data
+    try {
+        save_to_db(student_id, message)
+        push_to_app(student_id, message) // Real-time SSE stream push
+    } catch (err) {
+        throw err
+    }
+```
